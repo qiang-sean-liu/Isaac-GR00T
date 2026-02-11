@@ -114,6 +114,12 @@ Because our evaluation was performed on test cases of [BEHAVIOR Challenge](https
 python gr00t/eval/sim/BEHAVIOR/prepare_test_instances.py
 ```
 
+If you set **`OMNIGIBSON_DATA_PATH`** to a custom dataset root (e.g. `/mnt/nas26/qiang.liu/BEHAVIOR-1K/datasets`), the BEHAVIOR env expects **`2025-challenge-task-instances`** under that root:
+- **`2025-challenge-task-instances/metadata/`** — must contain `episodes.jsonl` and `test_instances.csv` (from the HF download).
+- **`2025-challenge-task-instances/scenes/`** — created automatically if missing; add scene data here if your task instances require it.
+
+After running `prepare_test_instances.py`, copy (or symlink) the downloaded `gr00t/eval/sim/BEHAVIOR/test_instances/` contents into `$OMNIGIBSON_DATA_PATH/2025-challenge-task-instances/` so that `metadata/` (and optionally `scenes/`) are in place.
+
 Note that BEHAVIOR sim is built on top of Omniverse and Isaac Sim, it inherits their spec dependencies. For example, GPUs without RT cores (A100, H100) are not supported. We tested on L40 and L40s. See [here](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/requirements.html) for more information.
 
 Then, run client server evaluation under the project root directory in separate terminals:
