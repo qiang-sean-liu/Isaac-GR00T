@@ -1,4 +1,5 @@
 import argparse
+import json
 from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import partial
@@ -7,13 +8,78 @@ import time
 from typing import Any
 import uuid
 
+import numpy as np
+
 from gr00t.data.embodiment_tags import EmbodimentTag
 from gr00t.eval.sim.env_utils import get_embodiment_tag_from_env_name
 from gr00t.eval.sim.wrapper.multistep_wrapper import MultiStepWrapper
 from gr00t.policy import BasePolicy
 import gymnasium as gym
-import numpy as np
 from tqdm import tqdm
+
+
+def _json_serializable(obj):
+    """Recursively convert ndarrays and numpy scalars in obj to Python types for JSON."""
+    if isinstance(obj, np.ndarray):
+        return _json_serializable(obj.tolist())
+    if isinstance(obj, (np.floating, np.integer, np.bool_)):
+        return float(obj) if isinstance(obj, np.floating) else int(obj) if isinstance(obj, np.integer) else bool(obj)
+    if isinstance(obj, dict):
+        return {k: _json_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_serializable(x) for x in obj]
+    return obj
+
+
+def _to_list_4f(arr) -> list:
+    """Convert array or list to list of 4-decimal strings for JSONL dump. Handles nested/object arrays (e.g. from vector env)."""
+    try:
+        a = np.asarray(arr, dtype=float).ravel()
+    except (ValueError, TypeError):
+        # Nested or object array (e.g. list of arrays from vector env)
+        flat = np.asarray(arr, dtype=object).ravel()
+        parts = [np.asarray(x, dtype=float).ravel() for x in flat]
+        a = np.concatenate(parts) if parts else np.array([])
+    return [f"{x:.4f}" for x in a.tolist()]
+
+
+def _observation_sim_for_dump(obs: dict, env_idx: int = 0) -> dict:
+    """Build observation_sim dict for one env for JSONL dump (includes floating_base_pose, floating_base_vel)."""
+    out = {}
+    for key in ("q", "dq", "floating_base_pose", "floating_base_vel"):
+        if key not in obs:
+            continue
+        v = obs[key]
+        if hasattr(v, "shape") and len(v.shape) > 1:
+            v = v[env_idx] if v.shape[0] > env_idx else v
+        out[key] = _to_list_4f(v)
+    if "annotation.human.task_description" in obs:
+        v = obs["annotation.human.task_description"]
+        if hasattr(v, "shape") and len(v.shape) > 0:
+            v = v[env_idx] if len(v) > env_idx else v
+        out["annotation.human.task_description"] = str(v)
+    for key in ("ego_view_image", "tpp_view_image", "video.ego_view", "video.tpp_view"):
+        if key not in obs:
+            continue
+        v = obs[key]
+        if hasattr(v, "shape"):
+            out[key] = {"shape": list(v.shape), "dtype": str(v.dtype)}
+        else:
+            out[key] = v
+    return out
+
+
+def _gr00t_action_for_dump(actions: dict, env_idx: int = 0) -> dict:
+    """Build gr00t action dict for dump (list of 4-decimal strings per key)."""
+    out = {}
+    for k, v in actions.items():
+        if not k.startswith("action."):
+            continue
+        a = np.asarray(v)
+        if hasattr(a, "shape") and len(a.shape) > 1:
+            a = a[env_idx]
+        out[k] = _to_list_4f(a)
+    return out
 
 
 @dataclass
@@ -239,6 +305,7 @@ def run_rollout_gymnasium_policy(
     wrapper_configs: WrapperConfigs,
     n_episodes: int = 10,
     n_envs: int = 1,
+    dump_io_path: str | Path | None = None,
 ) -> Any:
     """Run policy rollouts in parallel environments.
 
@@ -248,13 +315,21 @@ def run_rollout_gymnasium_policy(
         n_episodes: Number of episodes to run
         n_envs: Number of parallel environments
         wrapper_configs: Configuration for environment wrappers
-        ray_env: Whether to use ray gym env to create each env.
+        dump_io_path: If set (and env is gr00tlocomanip), write one JSONL line per step with observation_sim (q, dq, floating_base_pose, floating_base_vel), gr00t, wbc_goal, wbc, wbc_action.
     Returns:
         Collection results from running the episodes
     """
     start_time = time.time()
     n_episodes = max(n_episodes, n_envs)
     print(f"Running collecting {n_episodes} episodes for {env_name} with {n_envs} vec envs")
+
+    dump_io_path = Path(dump_io_path) if dump_io_path else None
+    dump_file = None
+    dump_step_count = 0
+    dump_episode_id = 0
+    if dump_io_path and env_name.startswith("gr00tlocomanip"):
+        dump_file = open(dump_io_path, "w", buffering=1)
+        print(f"Dump IO: writing to {dump_io_path}")
 
     env_fns = [
         partial(
@@ -294,6 +369,55 @@ def run_rollout_gymnasium_policy(
     while completed_episodes < n_episodes:
         actions, _ = policy.get_action(observations)
         next_obs, rewards, terminations, truncations, env_infos = env.step(actions)
+
+        if dump_file is not None and n_envs >= 1:
+            env_idx = 0
+
+            def _take_env(v, idx):
+                if isinstance(v, (list, tuple)) and len(v) > idx:
+                    return v[idx]
+                return v
+
+            def _dict_to_4f(d):
+                if d is None:
+                    return None
+                out = {}
+                for k, val in d.items():
+                    out[k] = _to_list_4f(val)
+                return out
+
+            obs_sim = _observation_sim_for_dump(observations, env_idx)
+            gr00t = _gr00t_action_for_dump(actions, env_idx)
+            rec = {
+                "step": f"{dump_step_count:4d}",
+                "episode": dump_episode_id,
+                "observation_sim": obs_sim,
+                "gr00t": gr00t,
+            }
+            if "wbc_goal" in env_infos:
+                v = _take_env(env_infos["wbc_goal"], env_idx)
+                rec["wbc_goal"] = _dict_to_4f(v) if isinstance(v, dict) else v
+            if "wbc" in env_infos:
+                v = _take_env(env_infos["wbc"], env_idx)
+                if isinstance(v, dict):
+                    rec["wbc"] = {k: _to_list_4f(val) for k, val in v.items()}
+                else:
+                    rec["wbc"] = v
+            if "wbc_action" in env_infos:
+                v = env_infos["wbc_action"]
+                wbc_q = _take_env(v, env_idx)
+                rec["wbc_action"] = _to_list_4f(wbc_q)
+            def _json_default(o):
+                if isinstance(o, np.ndarray):
+                    return o.tolist()
+                if isinstance(o, (np.floating, np.integer, np.bool_)):
+                    return float(o) if isinstance(o, np.floating) else (int(o) if isinstance(o, np.integer) else bool(o))
+                raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+
+            dump_file.write(
+                json.dumps(_json_serializable(rec), separators=(",", ":"), default=_json_default) + "\n"
+            )
+            dump_step_count += 1
         # NOTE (FY): Currently we don't properly handle policy reset. For now, our policy are stateless,
         # but in the future if we need policy to be stateful, we need to detect env reset and call policy.reset()
         i += 1
@@ -333,6 +457,9 @@ def run_rollout_gymnasium_policy(
 
             # If episode ended, store results
             if terminations[env_idx] or truncations[env_idx]:
+                if dump_file is not None and env_idx == 0:
+                    dump_episode_id += 1
+                    dump_step_count = 0
                 if "final_info" in env_infos:
                     current_successes[env_idx] |= any(env_infos["final_info"][env_idx]["success"])
                 if "task_progress" in env_infos:
@@ -359,6 +486,10 @@ def run_rollout_gymnasium_policy(
                 current_lengths[env_idx] = 0
         observations = next_obs
     pbar.close()
+
+    if dump_file is not None:
+        dump_file.close()
+        print(f"Dump IO: closed {dump_io_path}")
 
     env.reset()
     env.close()
@@ -416,10 +547,13 @@ def run_gr00t_sim_policy(
     policy_client_port: int | None = None,
     n_envs: int = 8,
     n_action_steps: int = 8,
+    dump_io_path: str | Path | None = None,
 ):
     embodiment_tag = get_embodiment_tag_from_env_name(env_name)
 
-    if model_path:
+    if dump_io_path is not None:
+        video_dir = str(Path(dump_io_path).resolve().parent)
+    elif model_path:
         video_dir = (
             f"/tmp/sim_eval_videos_{model_path.split('/')[-3]}_ac{n_action_steps}_{uuid.uuid4()}"
         )
@@ -450,6 +584,7 @@ def run_gr00t_sim_policy(
         wrapper_configs=wrapper_configs,
         n_episodes=n_episodes,
         n_envs=n_envs,
+        dump_io_path=dump_io_path,
     )
     print("Video saved to: ", wrapper_configs.video.video_dir)
     return results
@@ -473,6 +608,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--n_envs", type=int, default=8)
     parser.add_argument("--n_action_steps", type=int, default=8)
+    parser.add_argument(
+        "--dump_io_path",
+        type=str,
+        default=None,
+        help="If set, write one JSONL line per step (gr00tlocomanip only) with observation_sim (q, dq, floating_base_pose, floating_base_vel), gr00t, wbc_goal, wbc, wbc_action.",
+    )
 
     args = parser.parse_args()
 
@@ -495,6 +636,7 @@ if __name__ == "__main__":
         policy_client_port=args.policy_client_port,
         n_envs=args.n_envs,
         n_action_steps=args.n_action_steps,
+        dump_io_path=args.dump_io_path,
     )
     print("results: ", results)
     print("success rate: ", np.mean(results[1]))
