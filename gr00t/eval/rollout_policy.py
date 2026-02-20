@@ -32,19 +32,31 @@ def _json_serializable(obj):
 
 
 def _to_list_4f(arr) -> list:
-    """Convert array or list to list of 4-decimal strings for JSONL dump. Handles nested/object arrays (e.g. from vector env)."""
+    """Convert array or list to list of 4-decimal strings. Handles nested/object arrays (e.g. from vector env)."""
     try:
         a = np.asarray(arr, dtype=float).ravel()
     except (ValueError, TypeError):
-        # Nested or object array (e.g. list of arrays from vector env)
         flat = np.asarray(arr, dtype=object).ravel()
         parts = [np.asarray(x, dtype=float).ravel() for x in flat]
         a = np.concatenate(parts) if parts else np.array([])
     return [f"{x:.4f}" for x in a.tolist()]
 
 
-def _observation_sim_for_dump(obs: dict, env_idx: int = 0) -> dict:
-    """Build observation_sim dict for one env for JSONL dump (includes floating_base_pose, floating_base_vel)."""
+def _to_list_4f_float(arr) -> list:
+    """Convert array or list to list of floats with 4 decimal places (for JSON numbers in dump)."""
+    try:
+        a = np.asarray(arr, dtype=float).ravel()
+    except (ValueError, TypeError):
+        flat = np.asarray(arr, dtype=object).ravel()
+        parts = [np.asarray(x, dtype=float).ravel() for x in flat]
+        a = np.concatenate(parts) if parts else np.array([])
+    return [round(float(x), 4) for x in a.tolist()]
+
+
+def _observation_sim_for_dump(obs: dict, env_idx: int = 0, use_floats: bool = True) -> dict:
+    """Build observation_sim dict for one env for JSONL dump (includes floating_base_pose, floating_base_vel).
+    If use_floats, output numbers with 4 decimal places; else 4-decimal strings."""
+    to_list = _to_list_4f_float if use_floats else _to_list_4f
     out = {}
     for key in ("q", "dq", "floating_base_pose", "floating_base_vel"):
         if key not in obs:
@@ -52,7 +64,7 @@ def _observation_sim_for_dump(obs: dict, env_idx: int = 0) -> dict:
         v = obs[key]
         if hasattr(v, "shape") and len(v.shape) > 1:
             v = v[env_idx] if v.shape[0] > env_idx else v
-        out[key] = _to_list_4f(v)
+        out[key] = to_list(v)
     if "annotation.human.task_description" in obs:
         v = obs["annotation.human.task_description"]
         if hasattr(v, "shape") and len(v.shape) > 0:
@@ -69,16 +81,36 @@ def _observation_sim_for_dump(obs: dict, env_idx: int = 0) -> dict:
     return out
 
 
-def _gr00t_action_for_dump(actions: dict, env_idx: int = 0) -> dict:
-    """Build gr00t action dict for dump (list of 4-decimal strings per key)."""
+def _gr00t_action_for_dump(actions: dict, env_idx: int = 0, first_timestep_only: bool = True, use_floats: bool = True) -> dict:
+    """Build gr00t action dict for dump (list of numbers per key, 4 decimal places).
+    If first_timestep_only, take only the next-frame prediction (first timestep), not the full T-step horizon.
+    If use_floats, output numbers; else 4-decimal strings."""
+    to_list = _to_list_4f_float if use_floats else _to_list_4f
     out = {}
     for k, v in actions.items():
         if not k.startswith("action."):
             continue
         a = np.asarray(v)
-        if hasattr(a, "shape") and len(a.shape) > 1:
+        if hasattr(a, "shape") and len(a.shape) > 1 and a.shape[0] > env_idx:
             a = a[env_idx]
-        out[k] = _to_list_4f(a)
+        if first_timestep_only and hasattr(a, "shape") and a.ndim >= 2 and a.shape[0] > 1:
+            a = a[0]
+        elif first_timestep_only and hasattr(a, "shape") and a.ndim == 1:
+            if k == "action.base_height_command" and a.size > 1:
+                a = a[:1]
+            elif k == "action.navigate_command" and a.size > 3:
+                a = a[:3]
+            elif "left_arm" in k and a.size > 7:
+                a = a[:7]
+            elif "right_arm" in k and a.size > 7:
+                a = a[:7]
+            elif "left_hand" in k and a.size > 7:
+                a = a[:7]
+            elif "right_hand" in k and a.size > 7:
+                a = a[:7]
+            elif "waist" in k and a.size > 3:
+                a = a[:3]
+        out[k] = to_list(a)
     return out
 
 
@@ -374,6 +406,8 @@ def run_rollout_gymnasium_policy(
             env_idx = 0
 
             def _take_env(v, idx):
+                if isinstance(v, np.ndarray) and v.ndim >= 1 and v.shape[0] > idx:
+                    return v[idx]
                 if isinstance(v, (list, tuple)) and len(v) > idx:
                     return v[idx]
                 return v
@@ -383,30 +417,87 @@ def run_rollout_gymnasium_policy(
                     return None
                 out = {}
                 for k, val in d.items():
-                    out[k] = _to_list_4f(val)
+                    out[k] = _to_list_4f_float(val)
                 return out
 
+            def _first_step_value(v):
+                """Extract single next-frame value from nested multistep data.
+
+                Iteratively peels list/numpy wrappers until it finds a dict
+                (for wbc_goal/wbc) or a simple numeric array.
+                """
+                if v is None:
+                    return None
+                for _ in range(10):
+                    if isinstance(v, dict):
+                        return v
+                    if isinstance(v, (list, tuple)):
+                        if len(v) == 0:
+                            return v
+                        if isinstance(v[0], dict):
+                            return v[0]
+                        v = v[0]
+                        continue
+                    if isinstance(v, np.ndarray):
+                        if v.dtype == object:
+                            if v.ndim == 0:
+                                v = v.item()
+                                continue
+                            if v.size > 0:
+                                v = v.flat[0]
+                                continue
+                            return v
+                        if v.ndim >= 2 and v.shape[0] > 1:
+                            return v[0]
+                        return v
+                    return v
+                return v
+
             obs_sim = _observation_sim_for_dump(observations, env_idx)
-            gr00t = _gr00t_action_for_dump(actions, env_idx)
+            gr00t = _gr00t_action_for_dump(actions, env_idx, first_timestep_only=True)
             rec = {
-                "step": f"{dump_step_count:4d}",
+                "step": f"{dump_step_count:6d}",
                 "episode": dump_episode_id,
                 "observation_sim": obs_sim,
                 "gr00t": gr00t,
             }
             if "wbc_goal" in env_infos:
                 v = _take_env(env_infos["wbc_goal"], env_idx)
+                v = _first_step_value(v) if not isinstance(v, dict) else v
                 rec["wbc_goal"] = _dict_to_4f(v) if isinstance(v, dict) else v
             if "wbc" in env_infos:
                 v = _take_env(env_infos["wbc"], env_idx)
+                v = _first_step_value(v) if not isinstance(v, dict) else v
                 if isinstance(v, dict):
-                    rec["wbc"] = {k: _to_list_4f(val) for k, val in v.items()}
+                    rec["wbc"] = {k: _to_list_4f_float(np.asarray(val).ravel()) for k, val in v.items()}
                 else:
                     rec["wbc"] = v
             if "wbc_action" in env_infos:
                 v = env_infos["wbc_action"]
                 wbc_q = _take_env(v, env_idx)
-                rec["wbc_action"] = _to_list_4f(wbc_q)
+                wbc_q = np.asarray(wbc_q)
+                if wbc_q.dtype == object:
+                    wbc_q = np.concatenate(
+                        [np.asarray(x, dtype=float).ravel() for x in wbc_q.ravel()]
+                    )
+                if wbc_q.ndim >= 2 and wbc_q.shape[0] > 1:
+                    wbc_q = wbc_q[0]
+                wbc_q = wbc_q.ravel()[:43]
+                wbc_action_4f = _to_list_4f_float(wbc_q)
+                rec["wbc_action"] = wbc_action_4f
+                rec["sent_to_simulator"] = {"robot": wbc_action_4f}
+            def _round_floats_4(obj):
+                """Recursively round all floats to 4 decimal places so dump has no long decimals."""
+                if isinstance(obj, dict):
+                    return {k: _round_floats_4(val) for k, val in obj.items()}
+                if isinstance(obj, (list, tuple)):
+                    return [_round_floats_4(x) for x in obj]
+                if isinstance(obj, (float, np.floating)):
+                    return round(float(obj), 4)
+                if isinstance(obj, (int, np.integer, np.bool_)):
+                    return int(obj) if isinstance(obj, (np.integer, np.bool_)) else obj
+                return obj
+
             def _json_default(o):
                 if isinstance(o, np.ndarray):
                     return o.tolist()
@@ -414,6 +505,7 @@ def run_rollout_gymnasium_policy(
                     return float(o) if isinstance(o, np.floating) else (int(o) if isinstance(o, np.integer) else bool(o))
                 raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
 
+            rec = _round_floats_4(rec)
             dump_file.write(
                 json.dumps(_json_serializable(rec), separators=(",", ":"), default=_json_default) + "\n"
             )
@@ -457,7 +549,7 @@ def run_rollout_gymnasium_policy(
 
             # If episode ended, store results
             if terminations[env_idx] or truncations[env_idx]:
-                if dump_file is not None and env_idx == 0:
+                if env_idx == 0:
                     dump_episode_id += 1
                     dump_step_count = 0
                 if "final_info" in env_infos:
