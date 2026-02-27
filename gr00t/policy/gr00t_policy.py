@@ -43,6 +43,39 @@ def _rec_to_dtype(x: Any, dtype: torch.dtype) -> Any:
         return x
 
 
+def _merge_g1_statistics_into_processor(processor: Any, embodiment_tag: EmbodimentTag) -> None:
+    """Load statistics for the given embodiment from the G1 finetuned checkpoint and merge into
+    processor.state_action_processor so state/action normalization works with the generalist model.
+    """
+    if embodiment_tag.value != "unitree_g1":
+        return
+    try:
+        from copy import deepcopy
+
+        g1_processor = AutoProcessor.from_pretrained("nvidia/GR00T-N1.6-G1-PnPAppleToPlate")
+        sap = getattr(g1_processor, "state_action_processor", None)
+        if sap is None or embodiment_tag.value not in getattr(sap, "statistics", {}):
+            return
+        stats = sap.statistics.get(embodiment_tag.value)
+        if not stats:
+            return
+        # Convert to json-serializable form (lists) for set_statistics
+        def to_lists(obj: Any) -> Any:
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            if isinstance(obj, dict):
+                return {k: to_lists(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [to_lists(v) for v in obj]
+            return obj
+
+        processor.state_action_processor.set_statistics(
+            {embodiment_tag.value: to_lists(deepcopy(stats))}, override=True
+        )
+    except Exception:
+        pass  # Offline or G1 checkpoint not available; inference may fail on norm_params
+
+
 class Gr00tPolicy(BasePolicy):
     """Core policy class for Gr00t model inference.
 
@@ -85,12 +118,64 @@ class Gr00tPolicy(BasePolicy):
         self.model = model
 
         # Load the processor for input/output transformation
-        self.processor: BaseProcessor = AutoProcessor.from_pretrained(model_dir)
+        try:
+            self.processor = AutoProcessor.from_pretrained(model_dir)
+        except (OSError, ValueError):
+            if getattr(model.config, "model_type", None) == "gr00t_n1_5":
+                from gr00t.model.gr00t_n1_5.processing_n1_5_fallback import (
+                    Gr00tN15FallbackProcessor,
+                )
+                self.processor = Gr00tN15FallbackProcessor(
+                    embodiment_tag=embodiment_tag,
+                    model_config=model.config,
+                )
+            else:
+                raise
         self.processor.eval()
 
         # Store embodiment-specific configurations
         self.embodiment_tag = embodiment_tag
-        self.modality_configs = self.processor.get_modality_configs()[self.embodiment_tag.value]
+        configs = self.processor.get_modality_configs()
+        if self.embodiment_tag.value not in configs:
+            # Generalist checkpoint (e.g. GR00T-N1.6-3B) may not include all embodiments in
+            # saved processor config; merge in from codebase so UNITREE_G1 works.
+            from gr00t.configs.data.embodiment_configs import MODALITY_CONFIGS
+
+            if self.embodiment_tag.value not in MODALITY_CONFIGS:
+                raise KeyError(
+                    f"Embodiment '{self.embodiment_tag.value}' not in processor configs "
+                    f"(keys: {list(configs.keys())}) or MODALITY_CONFIGS"
+                )
+            self.processor.modality_configs[self.embodiment_tag.value] = MODALITY_CONFIGS[
+                self.embodiment_tag.value
+            ]
+            # state_action_processor has its own modality_configs; add same embodiment
+            if hasattr(self.processor, "state_action_processor") and getattr(
+                self.processor.state_action_processor, "modality_configs", None
+            ) is not None:
+                self.processor.state_action_processor.modality_configs[
+                    self.embodiment_tag.value
+                ] = MODALITY_CONFIGS[self.embodiment_tag.value]
+                # Generalist checkpoint has no statistics for unitree_g1; load from G1
+                # checkpoint so state/action normalization works.
+                _merge_g1_statistics_into_processor(self.processor, self.embodiment_tag)
+            # Ensure embodiment_id for forward pass (e.g. unitree_g1 -> 8)
+            if hasattr(self.processor, "embodiment_id_mapping") and (
+                self.processor.embodiment_id_mapping is not None
+            ):
+                from gr00t.model.gr00t_n1d6.processing_gr00t_n1d6 import (
+                    EMBODIMENT_TAG_TO_PROJECTOR_INDEX,
+                )
+
+                if self.embodiment_tag.value not in self.processor.embodiment_id_mapping:
+                    self.processor.embodiment_id_mapping[
+                        self.embodiment_tag.value
+                    ] = EMBODIMENT_TAG_TO_PROJECTOR_INDEX.get(
+                        self.embodiment_tag.value, 8
+                    )
+        self.modality_configs = self.processor.get_modality_configs()[
+            self.embodiment_tag.value
+        ]
         self.collate_fn = self.processor.collator
 
         # Extract and validate language configuration
